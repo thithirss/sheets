@@ -633,7 +633,10 @@ export function startWhatsAppWebIngest(params: { chatId?: string; chatName?: str
   };
 
   const client = new Client({
-    authStrategy: new LocalAuth({ clientId: "gastos" })
+    authStrategy: new LocalAuth({ clientId: "gastos" }),
+    puppeteer: {
+      args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    }
   });
 
   let selectedChatId: string | null = params.chatId ?? null;
