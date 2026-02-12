@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import qrcode from "qrcode-terminal";
 import pkg from "whatsapp-web.js";
-import { categories, categorizeExpense } from "./categories.js";
+import { categorizeExpense } from "./categories.js";
 import { getBudgetState } from "./budget.js";
 import { monthOf, monthStartEnd, todayISO } from "./dates.js";
 import { emitEvent } from "./events.js";
@@ -10,6 +10,7 @@ import { fromCents, parseAmount, toCents } from "./money.js";
 import { getLastMonthsTotals, getMonthSummary } from "./stats.js";
 import type { ExpenseRow } from "./types.js";
 import { db, getSetting, setSetting } from "./db.js";
+import { parseDateToken, parseExpenseInput, parseMenuChoice, resolveCategory } from "./waText.js";
 
 type WaWebStatus = {
   enabled: boolean;
@@ -34,39 +35,6 @@ export const waWebStatus: WaWebStatus = {
   lastAcceptedAt: null,
   lastRejectReason: null
 };
-
-type ParsedExpenseInput = { amount: number; description: string; dateISO: string; category: string };
-
-function stripAccents(input: string): string {
-  return input.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-}
-
-function normalizeCategoryToken(input: string): string {
-  return stripAccents(input).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-}
-
-function resolveCategory(input: string | null, description: string): string {
-  if (!input) return categorizeExpense(description);
-  const key = normalizeCategoryToken(input.replace(/^#/, ""));
-  const map: Record<string, string> = {
-    alimentacao: "Alimentação",
-    alimentacaoe: "Alimentação",
-    transporte: "Transporte",
-    moradia: "Moradia",
-    saude: "Saúde",
-    educacao: "Educação",
-    lazer: "Lazer",
-    compras: "Compras",
-    contas: "Contas",
-    outros: "Outros"
-  };
-
-  const mapped = map[key];
-  if (mapped) return mapped;
-
-  const byName = categories.find((c) => normalizeCategoryToken(c) === key);
-  return byName ?? categorizeExpense(description);
-}
 
 function formatBRL(value: number): string {
   return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(value);
@@ -96,7 +64,91 @@ function bar(value: number, max: number, width = 12): string {
 
 function card(title: string, lines: string[]): string {
   const body = lines.filter(Boolean).join("\n");
-  return [title, "—".repeat(28), body].filter(Boolean).join("\n");
+  const header = title.trim() ? `*${title.trim()}*` : "";
+  return [header, "—".repeat(28), body].filter(Boolean).join("\n");
+}
+
+type MsgCtx = { now: Date; senderDigits: string | null; senderName: string | null };
+type AbVariant = "A" | "B";
+
+function readCounter(key: string): number {
+  const raw = getSetting(key);
+  if (!raw) return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+function incCounter(key: string, delta = 1): void {
+  const next = readCounter(key) + delta;
+  setSetting(key, String(next));
+}
+
+function pickAbVariant(senderDigits: string | null): AbVariant {
+  if (!senderDigits) return "A";
+  const key = `wa_ab_variant_${senderDigits}`;
+  const existing = getSetting(key);
+  if (existing === "A" || existing === "B") return existing;
+
+  const bytes = crypto.createHash("sha256").update(senderDigits).digest();
+  const assigned: AbVariant = bytes[0]! % 2 === 0 ? "A" : "B";
+  setSetting(key, assigned);
+  return assigned;
+}
+
+function firstName(senderName: string | null): string | null {
+  const raw = (senderName ?? "").trim();
+  if (!raw) return null;
+  const first = raw.split(/\s+/)[0] ?? "";
+  return first.trim() || null;
+}
+
+function greetingLine(ctx: MsgCtx): string {
+  const { now } = ctx;
+  const hh = now.getHours();
+  const base = hh < 12 ? "Bom dia" : hh < 18 ? "Boa tarde" : "Boa noite";
+  const name = firstName(ctx.senderName);
+  const variants = [
+    `${base}${name ? `, ${name}` : ""}! 👋`,
+    `${base}${name ? `, ${name}` : ""}! ✨`,
+    `${base}${name ? `, ${name}` : ""}! 😄`,
+    `${base}${name ? `, ${name}` : ""}! Bora cuidar dos gastos? 💸`
+  ];
+  return variants[(hh + now.getDate()) % variants.length]!;
+}
+
+function instantLine(ctx: MsgCtx): string {
+  const v = pickAbVariant(ctx.senderDigits);
+  const variants =
+    v === "A"
+      ? ["Fechado! ✅", "Perfeito! ✅", "Boa! ✅", "Bora! ✅"]
+      : ["Certo ✅", "Ok ✅", "Feito ✅", "Vamos lá ✅"];
+  const { now } = ctx;
+  return variants[(now.getMinutes() + now.getHours()) % variants.length]!;
+}
+
+function menuText(ctx: MsgCtx): string {
+  const v = pickAbVariant(ctx.senderDigits);
+  incCounter(`wa_metric_${v}_menu_shown`);
+  return [
+    `${greetingLine(ctx)} Eu sou o *GastosBot* 🤝`,
+    "",
+    v === "A" ? "*Menu* (me diga o número 👇)" : "*Menu* (responda com o número)",
+    "1️⃣  Resumo do mês",
+    "2️⃣  Registrar gasto",
+    "3️⃣  Total do mês",
+    "4️⃣  Maior gasto",
+    "5️⃣  Orçamentos",
+    "6️⃣  Gráficos (texto)",
+    "7️⃣  Lista de gastos",
+    "8️⃣  Buscar gasto",
+    "9️⃣  Falar com atendente",
+    "",
+    "_Atalho:_ mande *0* ou *menu* pra voltar aqui.",
+    "",
+    "*Dica rápida*",
+    "• Você pode registrar direto: *45,90* Almoço restaurante",
+    "• Com categoria/data: *45,90* Almoço #alimentacao 2026-02-08"
+  ].join("\n");
 }
 
 function formatCategoryChart(items: Array<{ label: string; value: number }>): string {
@@ -128,85 +180,27 @@ function formatDayChart(items: Array<{ date: string; total: number }>): string {
     .join("\n");
 }
 
-function helpText(): string {
+function helpText(ctx: MsgCtx): string {
   return [
-    "Comandos:",
-    '• GASTO 45.90 Almoço restaurante',
-    '• 45.90 Almoço restaurante',
-    '• GASTO 45.90 Almoço #alimentacao 08/02',
-    '• RESUMO [AAAA-MM]',
-    '• TOTAL [AAAA-MM]',
-    '• MAIOR [AAAA-MM]',
-    '• ORCAMENTO [AAAA-MM] 2500',
-    '• ORCAMENTO SEMANAL 500',
-    '• ORCAMENTO Alimentação 800',
-    '• ORCAMENTO 2026-02 Alimentação 800',
-    '• ORCAMENTO [AAAA-MM] (ver)',
-    '• GRAFICO [AAAA-MM]',
-    '• LISTA [N] [AAAA-MM]',
-    '• BUSCA termo [AAAA-MM]',
-    '• DIA 2026-02-08 | DIA 08/02',
-    '• CATEGORIAS [AAAA-MM]',
-    '• DESFAZER',
-    '• REMOVER <id>',
-    '• EDITAR <id> 39.90',
-    '• HOJE',
-    '• AJUDA'
+    menuText(ctx),
+    "",
+    "—".repeat(28),
+    "*Comandos avançados*",
+    "• *RESUMO* [AAAA-MM]",
+    "• *TOTAL* [AAAA-MM]",
+    "• *MAIOR* [AAAA-MM]",
+    "• *GRAFICO* [AAAA-MM]",
+    "• *LISTA* [N] [AAAA-MM]",
+    "• *BUSCA* termo [AAAA-MM]",
+    "• *DIA* 2026-02-08 | *DIA* 08/02",
+    "• *CATEGORIAS* [AAAA-MM]",
+    "• *ORCAMENTO* [AAAA-MM] 2500 | *ORCAMENTO SEMANAL* 500",
+    "• *DESFAZER* | *REMOVER* <id> | *EDITAR* <id> 39.90 | *HOJE*"
   ].join("\n");
 }
 
 function monthDefault(): string {
   return todayISO().slice(0, 7);
-}
-
-function parseDateToken(token: string, now = new Date()): string | null {
-  const trimmed = token.trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
-  const m1 = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(trimmed);
-  if (m1) return `${m1[3]}-${m1[2]}-${m1[1]}`;
-  const m2 = /^(\d{2})\/(\d{2})$/.exec(trimmed);
-  if (m2) {
-    const y = now.getFullYear();
-    return `${y}-${m2[2]}-${m2[1]}`;
-  }
-  return null;
-}
-
-function extractTagToken(tokens: string[]): { tag: string | null; rest: string[] } {
-  const idx = tokens.findIndex((t) => t.startsWith("#") && t.length > 1);
-  if (idx === -1) return { tag: null, rest: tokens };
-  const tag = tokens[idx];
-  const rest = tokens.slice(0, idx).concat(tokens.slice(idx + 1));
-  return { tag, rest };
-}
-
-function parseExpenseInput(text: string): ParsedExpenseInput | null {
-  const raw = text.trim();
-  if (!raw) return null;
-
-  const tokens = raw.split(/\s+/).filter(Boolean);
-  if (!tokens.length) return null;
-
-  const isGasto = /^GASTO$/i.test(tokens[0]);
-  const work = isGasto ? tokens.slice(1) : tokens.slice(0);
-  if (!work.length) return null;
-
-  const { tag, rest: withoutTag } = extractTagToken(work);
-  let dateISO: string | null = null;
-  const last = withoutTag[withoutTag.length - 1] ?? "";
-  const parsedLastDate = parseDateToken(last);
-  const core = parsedLastDate ? withoutTag.slice(0, -1) : withoutTag;
-  if (parsedLastDate) dateISO = parsedLastDate;
-  if (!core.length) return null;
-
-  const amount = parseAmount(core[0]);
-  if (amount === null) return null;
-  const description = core.slice(1).join(" ").trim();
-  if (!description) return null;
-
-  const finalDate = dateISO ?? todayISO();
-  const category = resolveCategory(tag, description);
-  return { amount, description, dateISO: finalDate, category };
 }
 
 function idShort(id: string): string {
@@ -266,12 +260,117 @@ function monthTotalByCategory(month: string, category: string): number {
   return fromCents(row.totalCents ?? 0);
 }
 
-function handleCommand(body: string): string | null {
+function handleCommand(body: string, ctxInput?: Partial<MsgCtx>): string | null {
   const text = body.trim();
   if (!text) return null;
 
+  const ctx: MsgCtx = {
+    now: ctxInput?.now ?? new Date(),
+    senderDigits: ctxInput?.senderDigits ?? null,
+    senderName: ctxInput?.senderName ?? null
+  };
+
   const upper = text.toUpperCase();
-  if (upper === "AJUDA" || upper === "HELP" || upper === "MENU") return helpText();
+  if (upper === "AJUDA" || upper === "HELP" || upper === "MENU") return helpText(ctx);
+
+  const v = pickAbVariant(ctx.senderDigits);
+
+  if (upper === "METRICAS" || upper === "MÉTRICAS") {
+    const keys = [
+      "menu_shown",
+      "sentiment_help",
+      "thanks",
+      "support",
+      ...Array.from({ length: 10 }, (_, i) => `menu_choice_${i}`)
+    ];
+    const lines = [
+      `Experimento: ${v}`,
+      ...keys.map((k) => `${k}: ${readCounter(`wa_metric_${v}_${k}`)}`)
+    ];
+    return card("Métricas", lines);
+  }
+
+  if (/\b(triste|chatead|bravo|irritad|cansad|estressad|ansios|preocupad)\b/i.test(text)) {
+    incCounter(`wa_metric_${v}_sentiment_help`);
+    return [
+      "Poxa, entendi… 😕",
+      "Tamo junto. Vamos resolver do jeito mais simples possível.",
+      "",
+      "Se quiser, manda *menu* (ou *0*) e escolhe uma opção por número."
+    ].join("\n");
+  }
+
+  const choice = parseMenuChoice(text);
+  if (choice !== null) {
+    incCounter(`wa_metric_${v}_menu_choice_${choice}`);
+    if (choice === 0) return helpText(ctx);
+    const withHint = (content: string): string =>
+      [instantLine(ctx), "", content, "", "_Dica:_ mande *0* ou *menu* pra voltar ao menu."].join("\n");
+    if (choice === 1) return withHint(handleCommand("RESUMO", ctx) ?? "Sem dados para o resumo.");
+    if (choice === 2) {
+      return [
+        instantLine(ctx),
+        "",
+        card("Registrar gasto", [
+          "Me manda assim 👇",
+          "*45,90* Almoço restaurante 🥗",
+          "ou",
+          "*45,90* Almoço #alimentacao 2026-02-08",
+          "",
+          "_Dica:_ pode ser com vírgula ou ponto. Ex: 45,90 / 45.90"
+        ]),
+        "",
+        "_Dica:_ mande *0* ou *menu* pra voltar ao menu."
+      ].join("\n");
+    }
+    if (choice === 3) return withHint(handleCommand("TOTAL", ctx) ?? "Sem dados para o total.");
+    if (choice === 4) return withHint(handleCommand("MAIOR", ctx) ?? "Sem dados para o maior gasto.");
+    if (choice === 5) {
+      const current = handleCommand("ORCAMENTO", ctx) ?? "";
+      const howTo = card("Como ajustar", [
+        "Mensal: *ORCAMENTO 2500*",
+        "Outro mês: *ORCAMENTO 2026-02 2500*",
+        "Semanal: *ORCAMENTO SEMANAL 500*",
+        "Por categoria: *ORCAMENTO Alimentação 800*"
+      ]);
+      return withHint([current, "", howTo].filter(Boolean).join("\n"));
+    }
+    if (choice === 6) return withHint(handleCommand("GRAFICO", ctx) ?? "Sem dados para gráficos.");
+    if (choice === 7) return withHint(handleCommand("LISTA", ctx) ?? "Sem dados para listar.");
+    if (choice === 8) {
+      return [
+        instantLine(ctx),
+        "",
+        card("Buscar gasto", ["Use assim:", "*BUSCA* mercado", "ou", "*BUSCA* uber 2026-02", "", "Eu devolvo os matches mais recentes."]),
+        "",
+        "_Dica:_ mande *0* ou *menu* pra voltar ao menu."
+      ].join("\n");
+    }
+    if (choice === 9) {
+      return [
+        instantLine(ctx),
+        "",
+        card("Atendimento", [
+          "Se precisar de ajuda humana, manda uma mensagem com:",
+          "*SUPORTE* + sua dúvida",
+          "",
+          "Enquanto isso, posso te ajudar por aqui com o menu 😉"
+        ]),
+        "",
+        "_Dica:_ mande *0* ou *menu* pra voltar ao menu."
+      ].join("\n");
+    }
+  }
+
+  if (/^(OBRIGADO|OBRIGADA|VALEU|VLW|THANKS)\b/i.test(text)) {
+    incCounter(`wa_metric_${v}_thanks`);
+    return [greetingLine(ctx), pickAbVariant(ctx.senderDigits) === "A" ? "Fechou! Quer mais alguma? Manda *menu* 😄" : "Certo. Se precisar, mande *menu*."].join("\n");
+  }
+
+  if (/^SUPORTE\b/i.test(text)) {
+    incCounter(`wa_metric_${v}_support`);
+    return card("Suporte", ["Recebido! ✅", "Descreva o que aconteceu (e, se der, cole a mensagem que você enviou).", "Enquanto isso, *menu* te mostra os atalhos."]);
+  }
 
   const listaMatch = /^LISTA(?:\s+(\d+))?(?:\s+(\d{4}-\d{2}))?\s*$/i.exec(text);
   if (listaMatch) {
@@ -759,11 +858,16 @@ export function startWhatsAppWebIngest(params: { chatId?: string; chatName?: str
   }, 30_000);
 
   client.on("message", async (msg) => {
-    waWebStatus.lastMessageAt = new Date().toISOString();
+    const messageNow = new Date();
+    waWebStatus.lastMessageAt = messageNow.toISOString();
     const body = typeof msg.body === "string" ? msg.body : "";
     const from = typeof msg.from === "string" ? msg.from : "";
     const author = typeof msg.author === "string" ? msg.author : null;
     const fromMe = Boolean(msg.fromMe);
+    const senderName =
+      (typeof (msg as unknown as { _data?: { notifyName?: unknown } })._data?.notifyName === "string"
+        ? String((msg as unknown as { _data?: { notifyName?: unknown } })._data?.notifyName)
+        : null) ?? null;
 
     console.log(
       `[wa] message from=${from} author=${author ?? "-"} fromMe=${fromMe} body=${JSON.stringify(body.slice(0, 180))}`
@@ -787,10 +891,11 @@ export function startWhatsAppWebIngest(params: { chatId?: string; chatName?: str
       return;
     }
 
+    const directSender = normalizeWaIdToDigits(from);
+    const groupSender = author ? normalizeWaIdToDigits(author) : null;
+    const senderDigits = groupSender ?? directSender;
+
     if (allowedFromDigits.length) {
-      const directSender = normalizeWaIdToDigits(from);
-      const groupSender = author ? normalizeWaIdToDigits(author) : null;
-      const senderDigits = groupSender ?? directSender;
       const senderVariants = brVariantNumbers(senderDigits);
       const isAllowed = senderVariants.some((v) => allowedFromSet.has(v));
       if (!isAllowed) {
@@ -805,11 +910,19 @@ export function startWhatsAppWebIngest(params: { chatId?: string; chatName?: str
     notifyChatId = selectedChatId ?? from;
     if (notifyChatId) setSetting("wa_notify_chat_id", notifyChatId);
 
-    const cmd = handleCommand(body);
+    const cmd = handleCommand(body, { now: messageNow, senderDigits, senderName });
     if (cmd) {
       waWebStatus.lastAcceptedAt = new Date().toISOString();
       waWebStatus.lastRejectReason = null;
-      await msg.reply(cmd);
+      try {
+        const chat = await msg.getChat();
+        await chat.sendStateTyping();
+        await new Promise<void>((r) => setTimeout(r, 250));
+        await msg.reply(cmd);
+        await chat.clearState();
+      } catch {
+        await msg.reply(cmd);
+      }
       console.log("[wa] replied(command)");
       return;
     }
@@ -854,11 +967,20 @@ export function startWhatsAppWebIngest(params: { chatId?: string; chatName?: str
     }
 
     const reply = card("Registrado", [
-      `${formatBRL(parsedInput.amount)} • ${category}`,
+      `✅ *${formatBRL(parsedInput.amount)}* • _${category}_`,
       `${date}`,
-      parsedInput.description
+      parsedInput.description,
+      "Pronto! Quer ver o resumo? Envie *1* ou digite *menu*."
     ]);
-    await msg.reply(reply);
+    try {
+      const chat = await msg.getChat();
+      await chat.sendStateTyping();
+      await new Promise<void>((r) => setTimeout(r, 200));
+      await msg.reply(reply);
+      await chat.clearState();
+    } catch {
+      await msg.reply(reply);
+    }
     console.log("[wa] replied");
   });
 
