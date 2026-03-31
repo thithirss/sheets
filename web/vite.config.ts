@@ -5,9 +5,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      "/api": "http://localhost:5175",
-      "/webhook": "http://localhost:5175",
-      "/health": "http://localhost:5175"
+      "/api": "http://localhost:5176",
+      "/webhook": "http://localhost:5176",
+      "/health": "http://localhost:5176"
     }
   }
 });
